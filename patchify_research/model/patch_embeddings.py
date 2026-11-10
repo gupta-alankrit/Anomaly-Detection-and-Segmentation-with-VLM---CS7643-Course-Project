@@ -1,7 +1,8 @@
 """Extract ViT patch embeddings from an image using LAION CLIP ViT-B/16."""
 import argparse
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 
 import open_clip
 import torch
@@ -61,20 +62,27 @@ def _preprocessed_image(source_tensor, preprocess) -> Image.Image:
     return to_pil_image((source_tensor * std + mean).clamp(0, 1))
 
 
-def _compose_patches(source_img, patch_size, positions) -> Image.Image:
+def _compose_patches_from_sources(source_images, patch_size, positions) -> Image.Image:
     patch_height, patch_width = patch_size
-    columns = source_img.width // patch_width
-    rows = source_img.height // patch_height
-    if source_img.width % patch_width or source_img.height % patch_height or len(positions) != rows * columns:
+    width, height = source_images[0].size
+    columns = width // patch_width
+    rows = height // patch_height
+    if width % patch_width or height % patch_height or len(positions) != rows * columns:
         raise ValueError("Patch positions do not match the preprocessed image dimensions")
 
-    result = Image.new("RGB", source_img.size)
-    for query_index, (source_x, source_y) in enumerate(positions):
-        patch = source_img.crop((source_x, source_y, source_x + patch_width, source_y + patch_height))
+    result = Image.new("RGB", (width, height))
+    for query_index, (source_index, source_x, source_y) in enumerate(positions):
+        patch = source_images[source_index].crop(
+            (source_x, source_y, source_x + patch_width, source_y + patch_height)
+        )
         query_x = (query_index % columns) * patch_width
         query_y = (query_index // columns) * patch_height
         result.paste(patch, (query_x, query_y))
     return result
+
+
+def _compose_patches(source_img, patch_size, positions) -> Image.Image:
+    return _compose_patches_from_sources([source_img], patch_size, [(0, x, y) for x, y in positions])
 
 
 @torch.no_grad()
@@ -105,7 +113,7 @@ def _match_offset_positions(
     patch_size: tuple[int, int],
     divisions: int,
     encode: Callable[[torch.Tensor], torch.Tensor],
-) -> list[tuple[int, int]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     patch_height, patch_width = patch_size
     height, width = source_batch.shape[-2:]
     rows, columns = height // patch_height, width // patch_width
@@ -132,7 +140,7 @@ def _match_offset_positions(
             best_scores = torch.where(improved, scores, best_scores)
             best_x = torch.where(improved, (indices % columns) * patch_width + offset_x, best_x)
             best_y = torch.where(improved, (indices // columns) * patch_height + offset_y, best_y)
-    return list(zip(best_x.tolist(), best_y.tolist()))
+    return best_scores, best_x, best_y
 
 
 @torch.no_grad()
@@ -162,7 +170,8 @@ def create_offset_patch_img(source: Image.Image, query: Image.Image, model, prep
         _, tokens = model.visual(images)
         return F.normalize(tokens, dim=2)
 
-    positions = _match_offset_positions(source_batch, query_norm, model.visual.patch_size, divisions, encode)
+    _, x, y = _match_offset_positions(source_batch, query_norm, model.visual.patch_size, divisions, encode)
+    positions = list(zip(x.tolist(), y.tolist()))
     return _compose_patches(_preprocessed_image(source_tensor, preprocess), model.visual.patch_size, positions)
 
 
@@ -222,7 +231,7 @@ def _multiscale_embeddings(
 
 @torch.no_grad()
 def create_multiscale_patch_img(
-    source: Image.Image,
+    source: Image.Image | Sequence[Image.Image],
     query: Image.Image,
     model,
     preprocess,
@@ -233,19 +242,25 @@ def create_multiscale_patch_img(
     """Match query patches using concatenated, spatially aligned multiscale CLIP tokens.
 
     Scale weights specify the relative contributions to cosine similarity. Patch
-    positions and output pixels always come from the original preprocessed source.
+    Pass one source image or a nonempty sequence of source images. Each query
+    patch is matched against all sources. Output pixels come from the selected
+    preprocessed source image.
     k selects 4**k source grids with whole-pixel sub-patch offsets. Incomplete
     edge patches are excluded; padding supplies context for the encoder.
     """
     visual = model.visual
     if not isinstance(visual, VisionTransformer) or not visual.output_tokens:
         raise ValueError("Multiscale matching requires an OpenCLIP VisionTransformer with output_tokens enabled")
-    source_tensor = preprocess(source.convert("RGB"))
+    sources = [source] if isinstance(source, Image.Image) else list(source)
+    if not sources:
+        raise ValueError("At least one source image is required")
+    source_tensors = [preprocess(image.convert("RGB")) for image in sources]
     query_tensor = preprocess(query.convert("RGB"))
-    height, width = source_tensor.shape[-2:]
+    height, width = query_tensor.shape[-2:]
     patch_height, patch_width = visual.patch_size
     divisions = _offset_divisions(k, visual.patch_size)
-    if (query_tensor.shape != source_tensor.shape or (height, width) != tuple(visual.image_size)
+    if (any(tensor.shape != query_tensor.shape for tensor in source_tensors)
+            or (height, width) != tuple(visual.image_size)
             or height % patch_height or width % patch_width):
         raise ValueError("Preprocessed source and query must match the model image size and patch grid")
     if not scales or any(
@@ -259,26 +274,40 @@ def create_multiscale_patch_img(
         raise ValueError("Provide one finite non-negative weight per scale, with at least one positive weight")
 
     device = next(model.parameters()).device
-    if k == 0:
-        images = torch.stack((source_tensor, query_tensor)).to(device)
+    if k == 0 and len(source_tensors) == 1:
+        images = torch.stack((source_tensors[0], query_tensor)).to(device)
         features = _multiscale_embeddings(visual, images, scales, weights)
         indices = (features[0] @ features[1].T).argmax(dim=0).tolist()
         columns = width // patch_width
-        positions = [((index % columns) * patch_width, (index // columns) * patch_height) for index in indices]
+        positions = [(0, (index % columns) * patch_width, (index // columns) * patch_height) for index in indices]
     else:
-        source_batch = source_tensor.unsqueeze(0).to(device)
         query_features = _multiscale_embeddings(visual, query_tensor.unsqueeze(0).to(device), scales, weights)[0]
+        count = (height // patch_height) * (width // patch_width)
+        best_scores = torch.full((count,), -torch.inf, device=device)
+        best_source = torch.zeros(count, dtype=torch.long, device=device)
+        best_x = torch.zeros_like(best_source)
+        best_y = torch.zeros_like(best_source)
 
         def encode(images: torch.Tensor) -> torch.Tensor:
             return _multiscale_embeddings(visual, images, scales, weights)
 
-        positions = _match_offset_positions(source_batch, query_features, visual.patch_size, divisions, encode)
-    return _compose_patches(_preprocessed_image(source_tensor, preprocess), visual.patch_size, positions)
+        for source_index, source_tensor in enumerate(source_tensors):
+            scores, x, y = _match_offset_positions(
+                source_tensor.unsqueeze(0).to(device), query_features, visual.patch_size, divisions, encode
+            )
+            improved = scores > best_scores
+            best_scores = torch.where(improved, scores, best_scores)
+            best_source = torch.where(improved, source_index, best_source)
+            best_x = torch.where(improved, x, best_x)
+            best_y = torch.where(improved, y, best_y)
+        positions = list(zip(best_source.tolist(), best_x.tolist(), best_y.tolist()))
+    source_images = [_preprocessed_image(tensor, preprocess) for tensor in source_tensors]
+    return _compose_patches_from_sources(source_images, visual.patch_size, positions)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", help="Path to source image supplying patches")
+    parser.add_argument("source", nargs="+", help="One or more source images supplying patches")
     parser.add_argument("query", help="Path to query image defining patch positions")
     parser.add_argument("--output", help="Optional path to save the composite image")
     parser.add_argument("--multiscale", action="store_true", help="Match using multiscale image embeddings")
@@ -293,19 +322,23 @@ def main():
     args = parser.parse_args()
     if not args.multiscale and (args.scales is not None or args.scale_weights is not None):
         parser.error("--scales and --scale-weights require --multiscale")
+    if not args.multiscale and len(args.source) != 1:
+        parser.error("Multiple source images require --multiscale")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("using device", device)
     model, preprocess = load_model(device)
-    with Image.open(args.source) as source, Image.open(args.query) as query:
+    with ExitStack() as stack:
+        sources = [stack.enter_context(Image.open(path)) for path in args.source]
+        query = stack.enter_context(Image.open(args.query))
         if args.multiscale:
             scales = tuple(args.scales) if args.scales is not None else (224, 112, 64)
             weights = tuple(args.scale_weights) if args.scale_weights is not None else None
-            image = create_multiscale_patch_img(source, query, model, preprocess, scales, weights, k=args.offset_level)
+            image = create_multiscale_patch_img(sources, query, model, preprocess, scales, weights, k=args.offset_level)
         elif args.offset_level == 0:
-            image = create_patch_img(source, query, model, preprocess)
+            image = create_patch_img(sources[0], query, model, preprocess)
         else:
-            image = create_offset_patch_img(source, query, model, preprocess, args.offset_level)
+            image = create_offset_patch_img(sources[0], query, model, preprocess, args.offset_level)
     if args.output:
         image.save(args.output)
         print(f"saved to {args.output}")
