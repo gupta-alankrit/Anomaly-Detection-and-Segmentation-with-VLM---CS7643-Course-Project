@@ -25,6 +25,11 @@ class visual_encoder_clip(nn.Module):
         self.model.visual.output_tokens = True
 
     @torch.no_grad()
+    def encode(self, images):                 # images [B, 3, H, W], already preprocessed
+        pooled, tokens = self.model.visual(images)
+        return tokens, pooled                 # [B, N, 768], [B, 512]
+
+    @torch.no_grad()
     def forward(self, images: torch.Tensor):
         # images: [B, T, C, H, W], already preprocessed
         if images.ndim != 5:
