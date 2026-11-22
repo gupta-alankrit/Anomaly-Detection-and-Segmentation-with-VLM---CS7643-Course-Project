@@ -171,3 +171,19 @@ class SmolVLMBackbone(nn.Module):
         emb_ckpt = torch.load(os.path.join(save_dir, "seg_embeddings.pt"), map_location="cpu")
         self.vlm.get_input_embeddings().load_state_dict(emb_ckpt["embed_tokens"])
         self.vlm.get_output_embeddings().load_state_dict(emb_ckpt["lm_head"])
+
+class VisualResidualProjector(nn.Module):
+    def __init__(self, vis_dim: int, llm_dim: int, device: str = "cpu"):
+        super().__init__()
+        self.device = device
+        self.net = nn.Sequential(
+            nn.LayerNorm(vis_dim * 2),
+            nn.Linear(vis_dim * 2, llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim),
+        ).to(device)
+
+    def forward(self, x_q: torch.Tensor, delta_x: torch.Tensor) -> torch.Tensor:
+        # x_q, delta_x: [B, N_patches, vis_dim]
+        fused = torch.cat([x_q, delta_x], dim=-1)  # [B, N_patches, 2 * vis_dim]
+        return self.net(fused)                     # [B, N_patches, llm_dim]
