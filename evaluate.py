@@ -39,10 +39,32 @@ def parse_yes_no(text: str) -> int | None:
 
 
 def save_vis(query_img: Image.Image, gt_mask: np.ndarray, pred_prob: np.ndarray, out_path: str):
-    """Saves a 256x256 side-by-side strip: [Padded Query | GT Mask | Pred Heatmap]."""
+    """Saves a 256x256 side-by-side strip: [Padded Query | GT Mask (white) | Pred Heatmap]."""
     size = gt_mask.shape[0]
     q_rgb = pad_to_square(query_img).resize((size, size)).convert("RGB")
-    gt_rgb = Image.fromarray((gt_mask * 255).astype(np.uint8), mode="L").convert("RGB")
+
+    # Explicitly map any positive GT pixel to pure white (255)
+    gt_uint8 = np.where(gt_mask > 0, 255, 0).astype(np.uint8)
+    gt_rgb = Image.fromarray(gt_uint8, mode="L").convert("RGB")
+
+    pred_rgb = Image.fromarray((np.clip(pred_prob, 0, 1) * 255).astype(np.uint8), mode="L").convert("RGB")
+
+    strip = Image.new("RGB", (size * 3, size))
+    strip.paste(q_rgb, (0, 0))
+    strip.paste(gt_rgb, (size, 0))
+    strip.paste(pred_rgb, (size * 2, 0))
+    strip.save(out_path)
+
+
+def save_vis(query_img: Image.Image, gt_mask: np.ndarray, pred_prob: np.ndarray, out_path: str):
+    """Saves a 256x256 side-by-side strip: [Padded Query | GT Mask (white) | Pred Heatmap]."""
+    size = gt_mask.shape[0]
+    q_rgb = pad_to_square(query_img).resize((size, size)).convert("RGB")
+
+    # Explicitly map any positive GT pixel to pure white (255)
+    gt_uint8 = np.where(gt_mask > 0, 255, 0).astype(np.uint8)
+    gt_rgb = Image.fromarray(gt_uint8, mode="L").convert("RGB")
+
     pred_rgb = Image.fromarray((np.clip(pred_prob, 0, 1) * 255).astype(np.uint8), mode="L").convert("RGB")
 
     strip = Image.new("RGB", (size * 3, size))
@@ -64,7 +86,6 @@ def evaluate_category(
     tokenizer = model.vlm_backbone.tokenizer
     indices = list(range(len(ds)))
     if max_samples is not None and max_samples < len(indices):
-        # Stride evenly so we get a mix of normal and anomalous samples
         step = max(1, len(indices) // max_samples)
         indices = indices[::step][:max_samples]
 
@@ -75,7 +96,7 @@ def evaluate_category(
 
     if vis_dir:
         os.makedirs(os.path.join(vis_dir, category), exist_ok=True)
-    saved_vis = 0
+    saved_vis = {0: 0, 1: 0}  # Track normal (0) and anomalous (1) separately
 
     for idx in tqdm(indices, desc=f"Eval {category}", leave=False):
         sample = ds[idx]
@@ -121,22 +142,22 @@ def evaluate_category(
         elif pred_yn == gt_label:
             text_correct += 1
 
-        if saved_vis < num_vis:
+        if saved_vis[gt_label] < num_vis:
+            gt_px = int((gt_mask > 0).sum())
             print(
-                f"  [{category} | gt={gt_label} | max_p={pred_prob.max():.3f} | "
+                f"  [{category} | gt={gt_label} | gt_px={gt_px:4d} | max_p={pred_prob.max():.3f} | "
                 f"seg={sam_logits is not None}] {gen_text!r}"
             )
             if vis_dir:
                 out_path = os.path.join(vis_dir, category, f"sample_{idx}_gt{gt_label}.png")
                 save_vis(sample["query_img"], gt_mask, pred_prob, out_path)
-            saved_vis += 1
+            saved_vis[gt_label] += 1
 
     i_labels_arr = np.asarray(i_labels)
     i_scores_arr = np.asarray(i_scores)
     p_labels_arr = np.asarray(p_labels, dtype=np.uint8).ravel()
     p_scores_arr = np.asarray(p_scores, dtype=np.float32).ravel()
 
-    # Guard against single-class slices when --max_samples is tiny
     i_auroc = roc_auc_score(i_labels_arr, i_scores_arr) * 100 if len(np.unique(i_labels_arr)) > 1 else float("nan")
     p_aupr = average_precision_score(p_labels_arr, p_scores_arr) * 100 if p_labels_arr.sum() > 0 else float("nan")
     text_acc = (100.0 * text_correct / text_total) if text_total else 0.0

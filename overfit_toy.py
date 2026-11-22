@@ -1,6 +1,7 @@
 import torch
 from PIL import Image
 from arch.model import ad_model
+import bitsandbytes as bnb
 
 
 class AnomalyVLMTrainer:
@@ -31,11 +32,13 @@ class AnomalyVLMTrainer:
             )
             if p.requires_grad
         ]
+        sam_params = list(model.sam_head.prompt_generator.parameters()) + list(model.sam_head.sam.mask_decoder.parameters())
 
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = bnb.optim.PagedAdamW8bit(
             [
                 {"params": vlm_params, "lr": lr_vlm},
                 {"params": adapter_params, "lr": lr_adapters},
+                {"params": sam_params, "lr": lr_adapters},
             ],
             weight_decay=weight_decay,
         )
@@ -97,6 +100,7 @@ class AnomalyVLMTrainer:
         self.model.train()
         # Keep frozen CLIP in eval mode so dropout/norms don't drift
         self.model.clip_model.eval()
+        self.model.sam_head.sam.vision_encoder.eval()
 
         input_ids, attn_mask, labels = self.build_training_tokens(user_prompts, target_responses)
 
@@ -104,7 +108,7 @@ class AnomalyVLMTrainer:
 
         # BF16 autocast matches SmolVLMBackbone's compute_dtype and avoids needing GradScaler
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            vlm_out, _, _ = self.model(
+            output = self.model(
                 query_img=query_imgs,
                 reference_imgs=reference_imgs,
                 category=categories,
@@ -112,6 +116,7 @@ class AnomalyVLMTrainer:
                 text_attention_mask=attn_mask,
                 labels=labels,
             )
+            vlm_out = output["vlm_out"]
             loss = vlm_out["loss"]
 
         loss.backward()
