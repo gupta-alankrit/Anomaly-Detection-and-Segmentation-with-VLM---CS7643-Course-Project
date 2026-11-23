@@ -58,7 +58,7 @@ class ad_model(nn.Module):
         
         self.query_conditioned_text_adapter = QueryConditionedTextAdapter(llm_dim=self.vlm_hidden_size, device=device)
 
-        self.sam_head = SamMaskBranch(llm_dim=self.vlm_hidden_size, device=device)
+        self.sam_head = SamMaskBranch(llm_dim=self.vlm_hidden_size, vis_dim=self.vis_dim, device=device)
 
     def _build_prefix(
             self,
@@ -78,7 +78,7 @@ class ad_model(nn.Module):
         vis_llm = self.visual_residual_projector(query_features, absolute_residual)
 
         prefix_embeds = torch.cat([vis_llm, adapted_text_llm], dim=1)
-        return prefix_embeds, adapted_text, query_features, padded_query
+        return prefix_embeds, adapted_text, query_features, padded_query, absolute_residual
 
     def _extract_seg_hidden(
             self,
@@ -114,7 +114,7 @@ class ad_model(nn.Module):
             labels: torch.Tensor | None = None,
             mask_target_size: tuple[int, int] = (256, 256),
             ):
-        prefix_embeds, adapted_text, query_features, padded_query = self._build_prefix(
+        prefix_embeds, adapted_text, query_features, padded_query, absolute_residual = self._build_prefix(
             query_img, reference_imgs, category
         )
         B, prefix_len, _ = prefix_embeds.shape
@@ -139,7 +139,7 @@ class ad_model(nn.Module):
 
         # Extract <SEG> representation and run SAM mask decoder
         h_seg = self._extract_seg_hidden(vlm_out["last_hidden_state"], input_ids.to(device), prefix_len)
-        pred_masks = self.sam_head(padded_query, h_seg, target_size=mask_target_size)
+        pred_masks = self.sam_head(padded_query, absolute_residual, h_seg, target_size=mask_target_size)
 
         return {
             "vlm_out": vlm_out,
@@ -158,7 +158,7 @@ class ad_model(nn.Module):
         prompt_attention_mask: torch.Tensor,
         max_new_tokens: int = 64,
     ):
-        prefix_embeds, adapted_text, query_features, padded_query = self._build_prefix(query_img, reference_imgs, category)
+        prefix_embeds, adapted_text, query_features, padded_query, absolute_residual = self._build_prefix(query_img, reference_imgs, category)
         B, prefix_len, _ = prefix_embeds.shape
         device = prefix_embeds.device
 
@@ -175,7 +175,7 @@ class ad_model(nn.Module):
         )
 
         sam_output = (
-            self.sam_head(padded_query, seg_hidden_states, target_size=(1024, 1024))
+            self.sam_head(padded_query, absolute_residual, seg_hidden_states, target_size=(1024, 1024))
             if seg_hidden_states is not None
             else None
         )

@@ -23,12 +23,13 @@ def load_checkpoint(model: ad_model, ckpt_dir: str, device: str = "cuda"):
     model.query_conditioned_text_adapter.load_state_dict(heads["query_conditioned_text_adapter"])
     model.sam_head.prompt_generator.load_state_dict(heads["sam_prompt_generator"])
     model.sam_head.sam.mask_decoder.load_state_dict(heads["sam_mask_decoder"])
+    model.sam_head.dense_prompt_gen.load_state_dict(heads["sam_dense_prompt_gen"])
     model.eval()
 
 
 def parse_yes_no(text: str) -> int | None:
     """Returns 1 for Yes, 0 for No, or None if both/neither appear."""
-    lower = text.lower()
+    lower = text.split()[0].lower()
     has_yes = "yes" in lower
     has_no = "no" in lower
     if has_yes and not has_no:

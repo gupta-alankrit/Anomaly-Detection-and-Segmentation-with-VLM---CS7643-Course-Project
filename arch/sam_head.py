@@ -18,11 +18,31 @@ class PromptGenerator(nn.Module):
     def forward(self, h_seg: torch.Tensor) -> torch.Tensor:
         return self.net(h_seg).unsqueeze(1)  # [B, 1, 256]
 
+class DenseResidualPrompt(nn.Module):
+    """Maps patch residuals [B, N, vis_dim] -> SAM dense prompt [B, 256, 64, 64]."""
+    def __init__(self, vis_dim: int = 768, sam_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(vis_dim, sam_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(sam_dim, sam_dim, kernel_size=3, padding=1),
+        )
+        # Zero-init final conv so step 0 starts identically to SAM's default no_mask_embed
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, delta_x: torch.Tensor, grid_hw: tuple[int, int] = (64, 64)) -> torch.Tensor:
+        B, N, C = delta_x.shape
+        g = int(N ** 0.5)
+        spatial = delta_x.transpose(1, 2).reshape(B, C, g, g)  # [B, 768, 14, 14]
+        up = F.interpolate(spatial, size=grid_hw, mode="bilinear", align_corners=False)
+        return self.net(up)  # [B, 256, 64, 64]
 
 class SamMaskBranch(nn.Module):
-    def __init__(self, llm_dim: int, model_id: str = "facebook/sam-vit-base", device: str = "cuda"):
+    def __init__(self, llm_dim: int, model_id: str = "facebook/sam-vit-base", vis_dim: int = 768, device: str = "cuda"):
         super().__init__()
         self.device = device
+        self.vis_dim = vis_dim
         self.processor = SamProcessor.from_pretrained(model_id)
         self.sam = SamModel.from_pretrained(model_id).to(device)
 
@@ -33,6 +53,7 @@ class SamMaskBranch(nn.Module):
 
         sam_dim = self.sam.config.vision_config.output_channels  # 256
         self.prompt_generator = PromptGenerator(llm_dim=llm_dim, sam_prompt_dim=sam_dim).to(device)
+        self.dense_prompt_gen = DenseResidualPrompt(vis_dim=vis_dim, sam_dim=sam_dim).to(device)
 
     @torch.no_grad()
     def encode_images(self, query_imgs) -> torch.Tensor:
@@ -40,7 +61,7 @@ class SamMaskBranch(nn.Module):
         inputs = self.processor(images=query_imgs, return_tensors="pt").to(self.device)
         return self.sam.get_image_embeddings(inputs["pixel_values"])
 
-    def forward(self, query_imgs, h_seg: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
+    def forward(self, query_imgs, delta_x, h_seg: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
         """
         h_seg: [B, llm_dim] extracted from the VLM's <SEG> token position
         returns: mask logits of shape [B, 1, H, W]
@@ -54,8 +75,10 @@ class SamMaskBranch(nn.Module):
 
         # Standard SAM "no-mask" dense prompt embedding
         B = h_seg.shape[0]
-        dense_prompts = self.sam.prompt_encoder.no_mask_embed.weight.reshape(1, -1, 1, 1).expand(
-            B, -1, image_embeds.shape[-2], image_embeds.shape[-1]
+        dense_prompts = (
+            self.sam.prompt_encoder.no_mask_embed.weight.reshape(1, -1, 1, 1)
+            .expand(B, -1, image_embeds.shape[-2], image_embeds.shape[-1])
+            + self.dense_prompt_gen(delta_x, grid_hw=image_embeds.shape[-2:])
         )
 
         low_res_masks, _ = self.sam.mask_decoder(
