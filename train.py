@@ -54,6 +54,7 @@ class AnomalyVLMTrainer:
         lambda_align: float = 0.7,
         grad_accum_steps: int = 4,
         device: str = "cuda",
+        epochs: int = 10,
     ):
         self.model = model
         self.device = device
@@ -64,6 +65,7 @@ class AnomalyVLMTrainer:
         self.lambda_align = lambda_align
         self.grad_accum_steps = grad_accum_steps
         self.tokenizer = model.vlm_backbone.tokenizer
+        self.epochs = epochs
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -90,6 +92,9 @@ class AnomalyVLMTrainer:
                 {"params": sam_params, "lr": lr_adapters},
             ],
             weight_decay=weight_decay,
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=epochs, eta_min=1e-6
         )
 
     def build_training_tokens(
@@ -270,16 +275,19 @@ def main():
         lr_vlm=args.lr_vlm,
         lr_adapters=args.lr_adapters,
         grad_accum_steps=args.grad_accum_steps,
+        epochs=args.epochs,
         device=device,
     )
 
     for epoch in range(1, args.epochs + 1):
         avg = trainer.train_epoch(train_loader, epoch)
+        trainer.scheduler.step()
         print(
             f"Epoch {epoch} done | total={avg['total']:.4f} "
             f"ce={avg['ce']:.4f} focal={avg['focal']:.4f} dice={avg['dice']:.4f}"
         )
-        trainer.save_checkpoint(os.path.join(args.save_dir, f"epoch_{epoch}"))
+        if epoch % 5 == 0 or epoch == args.epochs:
+            trainer.save_checkpoint(os.path.join(args.save_dir, f"epoch_{epoch}"))
 
 
 if __name__ == "__main__":
