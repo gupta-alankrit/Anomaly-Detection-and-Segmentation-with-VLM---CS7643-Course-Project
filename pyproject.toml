@@ -1,0 +1,17 @@
+[project]
+name = "vlm-anomaly"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "open-clip-torch>=3.3.0",
+    "opencv-python>=5.1.0.95",
+    "pillow>=13.0.0",
+    "scikit-learn>=1.9.1",
+    "torch>=2.14.1",
+    "transformers>=5.22.2",
+]
+
+[dependency-groups]
+dev = [
+    "jupyterlab>=4.6.6",
+]
