@@ -3,8 +3,15 @@ name = "vlm-anomaly"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.16.0",
+    "bitsandbytes>=0.50.2",
+    "docopt>=0.6.2",
+    "matplotlib>=3.11.2",
+    "num2words>=0.5.14",
+    "nvidia-cuda-cccl>=13.3.5.0.6",
     "open-clip-torch>=3.3.0",
     "opencv-python>=5.1.0.95",
+    "peft>=0.22.0",
     "pillow>=13.0.0",
     "scikit-learn>=1.9.1",
     "torch>=2.14.1",
