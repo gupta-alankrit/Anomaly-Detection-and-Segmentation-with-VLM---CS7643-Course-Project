@@ -3,6 +3,7 @@ name = "vlm-anomaly"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.11.2",
     "open-clip-torch>=3.3.0",
     "opencv-python>=5.1.0.95",
     "pillow>=13.0.0",
