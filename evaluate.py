@@ -23,7 +23,7 @@ def load_checkpoint(model: ad_model, ckpt_dir: str, device: str = "cuda"):
     model.query_conditioned_text_adapter.load_state_dict(heads["query_conditioned_text_adapter"])
     model.sam_head.prompt_generator.load_state_dict(heads["sam_prompt_generator"])
     model.sam_head.sam.mask_decoder.load_state_dict(heads["sam_mask_decoder"])
-    model.sam_head.dense_prompt_gen.load_state_dict(heads["sam_dense_prompt_gen"])
+    # model.sam_head.dense_prompt_gen.load_state_dict(heads["sam_dense_prompt_gen"])
     model.eval()
 
 
@@ -162,6 +162,8 @@ def evaluate_category(
     i_auroc = roc_auc_score(i_labels_arr, i_scores_arr) * 100 if len(np.unique(i_labels_arr)) > 1 else float("nan")
     p_aupr = average_precision_score(p_labels_arr, p_scores_arr) * 100 if p_labels_arr.sum() > 0 else float("nan")
     text_acc = (100.0 * text_correct / text_total) if text_total else 0.0
+    normal_scores = i_scores_arr[i_labels_arr == 0]
+    anomalous_scores = i_scores_arr[i_labels_arr == 1]
 
     return {
         "category": category,
@@ -171,6 +173,8 @@ def evaluate_category(
         "text_acc": text_acc,
         "unparsed": text_unparsed,
         "seg_rate": 100.0 * seg_emitted / text_total,
+        "max_p_normal": float(normal_scores.mean()) if normal_scores.size else float("nan"),
+        "max_p_anomalous": float(anomalous_scores.mean()) if anomalous_scores.size else float("nan"),
     }
 
 
@@ -216,7 +220,9 @@ def main():
         print(
             f"{cat:12s} (n={res['n']:3d}) | I-AUROC: {res['i_auroc']:5.2f}% | "
             f"P-AUPR: {res['p_aupr']:5.2f}% | Text Acc: {res['text_acc']:5.2f}% "
-            f"(unparsed={res['unparsed']}) | <SEG> rate: {res['seg_rate']:5.1f}%"
+            f"(unparsed={res['unparsed']}) | <SEG> rate: {res['seg_rate']:5.1f}% | "
+            f"Avg max_p (normal): {res['max_p_normal']:.3f} | "
+            f"Avg max_p (anomalous): {res['max_p_anomalous']:.3f}"
         )
 
     if len(results) > 1:

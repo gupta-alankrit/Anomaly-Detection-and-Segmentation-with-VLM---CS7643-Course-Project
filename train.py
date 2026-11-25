@@ -13,13 +13,8 @@ from data.visa_dataset import CLASS_NAMES, VisADataset, visa_collate_fn
 
 
 def soft_dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
-    # Only compute Dice on samples that actually contain a defect
-    has_defect = targets.flatten(1).sum(dim=1) > 0
-    if not has_defect.any():
-        return logits.sum() * 0.0  # Zero loss, keeps autograd graph intact
-
-    probs = torch.sigmoid(logits[has_defect].float()).flatten(1)
-    targets = targets[has_defect].float().flatten(1)
+    probs = torch.sigmoid(logits.float()).flatten(1)
+    targets = targets.float().flatten(1)
     intersection = (probs * targets).sum(dim=1)
     denom = probs.sum(dim=1) + targets.sum(dim=1)
     dice = (2.0 * intersection + eps) / (denom + eps)
@@ -49,8 +44,8 @@ class AnomalyVLMTrainer:
         weight_decay: float = 0.01,
         max_grad_norm: float = 1.0,
         lambda_text: float = 1.0,
-        lambda_focal: float = 20.0,
-        lambda_dice: float = 1.0,
+        lambda_bce: float = 2.0,
+        lambda_dice: float = 0.5,
         lambda_align: float = 0.7,
         grad_accum_steps: int = 4,
         device: str = "cuda",
@@ -60,7 +55,7 @@ class AnomalyVLMTrainer:
         self.device = device
         self.max_grad_norm = max_grad_norm
         self.lambda_text = lambda_text
-        self.lambda_focal = lambda_focal
+        self.lambda_bce = lambda_bce
         self.lambda_dice = lambda_dice
         self.lambda_align = lambda_align
         self.grad_accum_steps = grad_accum_steps
@@ -81,15 +76,20 @@ class AnomalyVLMTrainer:
         sam_params = (
             list(model.sam_head.prompt_generator.parameters())
             + list(model.sam_head.sam.mask_decoder.parameters())
-            + list(model.sam_head.dense_prompt_gen.parameters())
         )
 
         self.trainable_params = vlm_params + adapter_params + sam_params
+        sam_new_params = (
+            list(model.sam_head.prompt_generator.parameters())
+        )
+        sam_decoder_params = list(model.sam_head.sam.mask_decoder.parameters())
+
         self.optimizer = bnb.optim.PagedAdamW8bit(
             [
-                {"params": vlm_params, "lr": lr_vlm},
-                {"params": adapter_params, "lr": lr_adapters},
-                {"params": sam_params, "lr": lr_adapters},
+                {"params": vlm_params, "lr": lr_vlm},            # e.g. 5e-5
+                {"params": adapter_params, "lr": lr_adapters},   # e.g. 5e-4
+                {"params": sam_new_params, "lr": lr_adapters},   # e.g. 5e-4
+                {"params": sam_decoder_params, "lr": 1e-4},      # pretrained decoder
             ],
             weight_decay=weight_decay,
         )
@@ -140,23 +140,24 @@ class AnomalyVLMTrainer:
         ce_loss = output["vlm_out"]["loss"]
         pred_masks = output["pred_masks"]
 
-        sfl = sigmoid_focal_loss(pred_masks.float(), gt_masks.float())
+        # sfl = sigmoid_focal_loss(pred_masks.float(), gt_masks.float())
+        bce = F.binary_cross_entropy_with_logits(pred_masks.float(), gt_masks.float())
         dice_loss = soft_dice_loss(pred_masks, gt_masks)
 
         # Project pooled query patches [B, 768] -> [B, 512] CLIP text space
         pooled_proj = output["query_features"].mean(dim=1).float() @ self.model.clip_model.visual.proj.float()
-        a_loss = align_loss(pooled_proj, output["adapted_text"].float(), is_anomalous)
+        a_loss = align_loss(pooled_proj, output["adapted_text"].float(), is_anomalous, scale=20)
 
         total_loss = (
             self.lambda_text * ce_loss
-            + self.lambda_focal * sfl
+            + self.lambda_bce * bce
             + self.lambda_dice * dice_loss
             + self.lambda_align * a_loss
         )
         metrics = {
             "total": total_loss.item(),
             "ce": ce_loss.item(),
-            "focal": sfl.item(),
+            "bce": bce.item(),
             "dice": dice_loss.item(),
             "align": a_loss.item(),
         }
@@ -169,7 +170,7 @@ class AnomalyVLMTrainer:
         self.model.sam_head.sam.prompt_encoder.eval()
 
         self.optimizer.zero_grad()
-        running = {"total": 0.0, "ce": 0.0, "focal": 0.0, "dice": 0.0, "align": 0.0}
+        running = {"total": 0.0, "ce": 0.0, "bce": 0.0, "dice": 0.0, "align": 0.0}
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True)
 
         for step, batch in enumerate(pbar, start=1):
@@ -190,6 +191,11 @@ class AnomalyVLMTrainer:
                 )
                 loss, metrics = self.compute_loss(output, gt_masks, batch["is_anomalous"].to(self.device))
 
+            if not torch.isfinite(loss):
+                print(f"\n[WARN] Non-finite loss at epoch {epoch} step {step}: {metrics}")
+                self.optimizer.zero_grad()
+                continue
+            
             # Scale loss for gradient accumulation
             (loss / self.grad_accum_steps).backward()
 
@@ -204,7 +210,7 @@ class AnomalyVLMTrainer:
             pbar.set_postfix(
                 tot=f"{running['total'] / step:.3f}",
                 ce=f"{running['ce'] / step:.3f}",
-                focal=f"{running['focal'] / step:.3f}",
+                bce=f"{running['bce'] / step:.3f}",
                 dice=f"{running['dice'] / step:.3f}",
                 align=f"{running['align'] / step:.3f}",
                 max_p=f"{output['pred_masks'].sigmoid().max().item():.2f}"
@@ -223,7 +229,6 @@ class AnomalyVLMTrainer:
                 "query_conditioned_text_adapter": self.model.query_conditioned_text_adapter.state_dict(),
                 "sam_prompt_generator": self.model.sam_head.prompt_generator.state_dict(),
                 "sam_mask_decoder": self.model.sam_head.sam.mask_decoder.state_dict(),
-                "sam_dense_prompt_gen": self.model.sam_head.dense_prompt_gen.state_dict(),
             },
             os.path.join(save_dir, "custom_heads.pt"),
         )
@@ -284,7 +289,7 @@ def main():
         trainer.scheduler.step()
         print(
             f"Epoch {epoch} done | total={avg['total']:.4f} "
-            f"ce={avg['ce']:.4f} focal={avg['focal']:.4f} dice={avg['dice']:.4f}"
+            f"ce={avg['ce']:.4f} bce={avg['bce']:.4f} dice={avg['dice']:.4f}"
         )
         if epoch % 5 == 0 or epoch == args.epochs:
             trainer.save_checkpoint(os.path.join(args.save_dir, f"epoch_{epoch}"))

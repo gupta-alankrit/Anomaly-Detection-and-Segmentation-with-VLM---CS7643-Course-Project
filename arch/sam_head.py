@@ -53,7 +53,7 @@ class SamMaskBranch(nn.Module):
 
         sam_dim = self.sam.config.vision_config.output_channels  # 256
         self.prompt_generator = PromptGenerator(llm_dim=llm_dim, sam_prompt_dim=sam_dim).to(device)
-        self.dense_prompt_gen = DenseResidualPrompt(vis_dim=vis_dim, sam_dim=sam_dim).to(device)
+        # self.dense_prompt_gen = DenseResidualPrompt(vis_dim=vis_dim, sam_dim=sam_dim).to(device)
 
     @torch.no_grad()
     def encode_images(self, query_imgs) -> torch.Tensor:
@@ -78,7 +78,7 @@ class SamMaskBranch(nn.Module):
         dense_prompts = (
             self.sam.prompt_encoder.no_mask_embed.weight.reshape(1, -1, 1, 1)
             .expand(B, -1, image_embeds.shape[-2], image_embeds.shape[-1])
-            + self.dense_prompt_gen(delta_x, grid_hw=image_embeds.shape[-2:])
+            # + self.dense_prompt_gen(delta_x, grid_hw=image_embeds.shape[-2:])
         )
 
         low_res_masks, _ = self.sam.mask_decoder(
