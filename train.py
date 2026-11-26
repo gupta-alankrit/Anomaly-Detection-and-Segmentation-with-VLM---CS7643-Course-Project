@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from arch.model import ad_model
 from arch.text_adapter import align_loss
-from data.visa_dataset import CLASS_NAMES, VisADataset, visa_collate_fn
+from data.mmr_ad_dataset import MMRADDataset, mmr_ad_collate_fn
 
 
 def soft_dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
@@ -61,6 +61,7 @@ class AnomalyVLMTrainer:
         self.grad_accum_steps = grad_accum_steps
         self.tokenizer = model.vlm_backbone.tokenizer
         self.epochs = epochs
+        self.global_step = 0
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -163,7 +164,7 @@ class AnomalyVLMTrainer:
         }
         return total_loss, metrics
 
-    def train_epoch(self, dataloader: DataLoader, epoch: int) -> dict:
+    def train_epoch(self, dataloader: DataLoader, epoch: int, save_dir: str | None = None, save_every_steps: int = 1000) -> dict:
         self.model.train()
         self.model.clip_model.eval()
         self.model.sam_head.sam.vision_encoder.eval()
@@ -202,7 +203,12 @@ class AnomalyVLMTrainer:
             if step % self.grad_accum_steps == 0 or step == len(dataloader):
                 torch.nn.utils.clip_grad_norm_(self.trainable_params, self.max_grad_norm)
                 self.optimizer.step()
+                self.scheduler.step()
                 self.optimizer.zero_grad()
+                self.global_step += 1
+
+                if save_dir and self.global_step % save_every_steps == 0:
+                    self.save_checkpoint(os.path.join(save_dir, f"step_{self.global_step}"))
 
             for k in running:
                 running[k] += metrics[k]
@@ -236,7 +242,7 @@ class AnomalyVLMTrainer:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, default="data/VisA")
+    p.add_argument("--data_root", type=str, default="data/MMR-AD")
     p.add_argument("--save_dir", type=str, default="checkpoints/visa_run1")
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--grad_accum_steps", type=int, default=4)
@@ -252,27 +258,28 @@ def main():
     args = parse_args()
     device = "cuda"
 
-    train_cats = [c for c in CLASS_NAMES if c not in set(args.val_categories)]
-    print(f"Training categories ({len(train_cats)}): {train_cats}")
-    print(f"Held-out categories ({len(args.val_categories)}): {args.val_categories}")
 
     # Note: VisA's 'test' split contains both normal and anomalous images (~1:1).
     # Normal references are still drawn from the 'train' split inside VisADataset.
-    train_ds = VisADataset(
-        root_dir=args.data_root,
-        split="test",
-        categories=train_cats,
+    train_ds = MMRADDataset(
+        root_dir=args.data_root,           # e.g. "data/MMR-AD"
+        exclude_subdatasets=["visa"],      # Keep VisA 100% held-out for eval
         k_shot=args.k_shot,
         mask_size=256,
         random_refs=True,
+        strict=False,                      # Skip any single malformed entry instead of crashing
     )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
-        collate_fn=visa_collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=mmr_ad_collate_fn,
     )
+
+    total_opt_steps = (len(train_loader) // args.grad_accum_steps) * args.epochs
+    T_max=total_opt_steps
 
     model = ad_model(device=device)
     trainer = AnomalyVLMTrainer(
@@ -285,7 +292,7 @@ def main():
     )
 
     for epoch in range(1, args.epochs + 1):
-        avg = trainer.train_epoch(train_loader, epoch)
+        avg = trainer.train_epoch(train_loader, epoch, save_dir=args.save_dir, save_every_steps=1000)
         trainer.scheduler.step()
         print(
             f"Epoch {epoch} done | total={avg['total']:.4f} "

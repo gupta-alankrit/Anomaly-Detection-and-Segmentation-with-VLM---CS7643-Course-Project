@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from PIL import Image
 from sklearn.metrics import average_precision_score, roc_auc_score
 from tqdm import tqdm
+import re
 
 from arch.model import ad_model, pad_to_square
 from data.visa_dataset import CLASS_NAMES, VisADataset
@@ -28,10 +29,8 @@ def load_checkpoint(model: ad_model, ckpt_dir: str, device: str = "cuda"):
 
 
 def parse_yes_no(text: str) -> int | None:
-    """Returns 1 for Yes, 0 for No, or None if both/neither appear."""
-    lower = text.split()[0].lower()
-    has_yes = "yes" in lower
-    has_no = "no" in lower
+    clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).lower()
+    has_yes, has_no = "yes" in clean, "no" in clean
     if has_yes and not has_no:
         return 1
     if has_no and not has_yes:
@@ -39,22 +38,22 @@ def parse_yes_no(text: str) -> int | None:
     return None
 
 
-def save_vis(query_img: Image.Image, gt_mask: np.ndarray, pred_prob: np.ndarray, out_path: str):
-    """Saves a 256x256 side-by-side strip: [Padded Query | GT Mask (white) | Pred Heatmap]."""
-    size = gt_mask.shape[0]
-    q_rgb = pad_to_square(query_img).resize((size, size)).convert("RGB")
+# def save_vis(query_img: Image.Image, gt_mask: np.ndarray, pred_prob: np.ndarray, out_path: str):
+#     """Saves a 256x256 side-by-side strip: [Padded Query | GT Mask (white) | Pred Heatmap]."""
+#     size = gt_mask.shape[0]
+#     q_rgb = pad_to_square(query_img).resize((size, size)).convert("RGB")
 
-    # Explicitly map any positive GT pixel to pure white (255)
-    gt_uint8 = np.where(gt_mask > 0, 255, 0).astype(np.uint8)
-    gt_rgb = Image.fromarray(gt_uint8, mode="L").convert("RGB")
+#     # Explicitly map any positive GT pixel to pure white (255)
+#     gt_uint8 = np.where(gt_mask > 0, 255, 0).astype(np.uint8)
+#     gt_rgb = Image.fromarray(gt_uint8, mode="L").convert("RGB")
 
-    pred_rgb = Image.fromarray((np.clip(pred_prob, 0, 1) * 255).astype(np.uint8), mode="L").convert("RGB")
+#     pred_rgb = Image.fromarray((np.clip(pred_prob, 0, 1) * 255).astype(np.uint8), mode="L").convert("RGB")
 
-    strip = Image.new("RGB", (size * 3, size))
-    strip.paste(q_rgb, (0, 0))
-    strip.paste(gt_rgb, (size, 0))
-    strip.paste(pred_rgb, (size * 2, 0))
-    strip.save(out_path)
+#     strip = Image.new("RGB", (size * 3, size))
+#     strip.paste(q_rgb, (0, 0))
+#     strip.paste(gt_rgb, (size, 0))
+#     strip.paste(pred_rgb, (size * 2, 0))
+#     strip.save(out_path)
 
 
 def save_vis(query_img: Image.Image, gt_mask: np.ndarray, pred_prob: np.ndarray, out_path: str):
@@ -115,7 +114,7 @@ def evaluate_category(
                 category=[category],
                 prompt_input_ids=inputs["input_ids"],
                 prompt_attention_mask=inputs["attention_mask"],
-                max_new_tokens=64,
+                max_new_tokens=256,
             )
 
         gen_text = texts[0]
