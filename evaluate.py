@@ -105,7 +105,7 @@ def evaluate_category(
             tokenize=False,
             add_generation_prompt=True,
         )
-        inputs = tokenizer(prompt_str, return_tensors="pt").to(device)
+        inputs = tokenizer(prompt_str, add_special_tokens=False, return_tensors="pt").to(device)
         gt_mask = sample["mask"].squeeze(0).numpy()  # [256, 256]
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):

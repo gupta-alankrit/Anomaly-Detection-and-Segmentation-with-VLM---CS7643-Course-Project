@@ -103,19 +103,13 @@ class ad_model(nn.Module):
         rows = torch.arange(target_ids.shape[0], device=last_hidden_state.device)
         return last_hidden_state[rows, prediction_positions]
 
-    def forward(
+    def _teacher_forced_vlm(
             self,
-            query_img: Sequence[Image.Image],
-            reference_imgs: Sequence[Sequence[Image.Image]],
-            category: Sequence[str],
+            prefix_embeds: torch.Tensor,
             input_ids: torch.Tensor,
             text_attention_mask: torch.Tensor,
-            labels: torch.Tensor | None = None,
-            mask_target_size: tuple[int, int] = (256, 256),
-            ):
-        prefix_embeds, adapted_text, features = self._build_prefix(
-            query_img, reference_imgs, category
-        )
+            labels: torch.Tensor | None,
+            ) -> tuple[dict, torch.Tensor]:
         B, prefix_len, _ = prefix_embeds.shape
         device = prefix_embeds.device
 
@@ -139,6 +133,20 @@ class ad_model(nn.Module):
         target_ids = labels if labels is not None else input_ids
         target_ids = target_ids.to(device).masked_fill(text_attention_mask.to(device) == 0, -100)
         h_seg = self._extract_seg_hidden(vlm_out["last_hidden_state"], target_ids, prefix_len)
+        return vlm_out, h_seg
+
+    def forward(
+            self,
+            query_img: Sequence[Image.Image],
+            reference_imgs: Sequence[Sequence[Image.Image]],
+            category: Sequence[str],
+            input_ids: torch.Tensor,
+            text_attention_mask: torch.Tensor,
+            labels: torch.Tensor | None = None,
+            mask_target_size: tuple[int, int] = (256, 256),
+            ):
+        prefix_embeds, adapted_text, features = self._build_prefix(query_img, reference_imgs, category)
+        vlm_out, h_seg = self._teacher_forced_vlm(prefix_embeds, input_ids, text_attention_mask, labels)
         pred_masks = self.mask_head(
             features.clip_patches, adapted_text, features.reference_distance, h_seg,
             grid_size=self.clip_model.visual.grid_size, target_size=mask_target_size,

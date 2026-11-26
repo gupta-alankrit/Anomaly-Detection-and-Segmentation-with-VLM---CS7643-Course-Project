@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 
 import bitsandbytes as bnb
@@ -11,6 +12,9 @@ from arch.model import ad_model
 from arch.text_adapter import align_loss
 from data.mmr_ad_dataset import MMRADDataset, mmr_ad_collate_fn
 
+MASK_BCE_WEIGHT = 2.0
+MASK_DICE_WEIGHT = 0.5
+
 
 def soft_dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
     probs = torch.sigmoid(logits.float()).flatten(1)
@@ -19,6 +23,18 @@ def soft_dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1.0
     denom = probs.sum(dim=1) + targets.sum(dim=1)
     dice = (2.0 * intersection + eps) / (denom + eps)
     return (1.0 - dice).mean()
+
+
+def mask_loss_components(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pos_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logits = logits.float()
+    targets = targets.float()
+    bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+    return bce, soft_dice_loss(logits, targets)
+
 
 def sigmoid_focal_loss(
     logits: torch.Tensor,
@@ -35,6 +51,42 @@ def sigmoid_focal_loss(
     loss = alpha_t * ((1.0 - p_t) ** gamma) * bce
     return loss.mean()
 
+
+def build_training_tokens(
+    tokenizer,
+    user_prompts: list[str],
+    target_responses: list[str],
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    full_ids_list = []
+    labels_list = []
+
+    for prompt, target in zip(user_prompts, target_responses, strict=True):
+        messages = [{"role": "user", "content": prompt}]
+        prompt_str = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_ids = tokenizer(prompt_str, add_special_tokens=False)["input_ids"]
+        target_ids = tokenizer(target + tokenizer.eos_token, add_special_tokens=False)["input_ids"]
+
+        full_ids_list.append(torch.tensor(prompt_ids + target_ids, dtype=torch.long))
+        labels_list.append(torch.tensor([-100] * len(prompt_ids) + target_ids, dtype=torch.long))
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    shape = (len(full_ids_list), max(seq.size(0) for seq in full_ids_list))
+    input_ids = torch.full(shape, pad_id, dtype=torch.long)
+    attention_mask = torch.zeros(shape, dtype=torch.long)
+    labels = torch.full(shape, -100, dtype=torch.long)
+
+    for row, (ids, target) in enumerate(zip(full_ids_list, labels_list, strict=True)):
+        seq_len = ids.size(0)
+        input_ids[row, :seq_len] = ids
+        attention_mask[row, :seq_len] = 1
+        labels[row, :seq_len] = target
+
+    return input_ids.to(device), attention_mask.to(device), labels.to(device)
+
+
 class AnomalyVLMTrainer:
     def __init__(
         self,
@@ -44,12 +96,13 @@ class AnomalyVLMTrainer:
         weight_decay: float = 0.01,
         max_grad_norm: float = 1.0,
         lambda_text: float = 1.0,
-        lambda_bce: float = 2.0,
-        lambda_dice: float = 0.5,
+        lambda_bce: float = MASK_BCE_WEIGHT,
+        lambda_dice: float = MASK_DICE_WEIGHT,
         lambda_align: float = 0.7,
         grad_accum_steps: int = 4,
         device: str = "cuda",
-        epochs: int = 10,
+        *,
+        total_optimizer_steps: int,
     ):
         self.model = model
         self.device = device
@@ -60,11 +113,7 @@ class AnomalyVLMTrainer:
         self.lambda_align = lambda_align
         self.grad_accum_steps = grad_accum_steps
         self.tokenizer = model.vlm_backbone.tokenizer
-        self.epochs = epochs
         self.global_step = 0
-
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
 
         vlm_params = [p for p in model.vlm_backbone.parameters() if p.requires_grad]
         adapter_params = [
@@ -86,55 +135,12 @@ class AnomalyVLMTrainer:
             weight_decay=weight_decay,
         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=epochs, eta_min=1e-6
+            self.optimizer, T_max=total_optimizer_steps, eta_min=1e-6
         )
-
-    def build_training_tokens(
-        self,
-        user_prompts: list[str],
-        target_responses: list[str],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        full_ids_list = []
-        labels_list = []
-
-        for prompt, target in zip(user_prompts, target_responses):
-            messages = [{"role": "user", "content": prompt}]
-            prompt_str = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            target_str = target + self.tokenizer.eos_token
-
-            prompt_ids = self.tokenizer(prompt_str, add_special_tokens=False)["input_ids"]
-            target_ids = self.tokenizer(target_str, add_special_tokens=False)["input_ids"]
-
-            full_ids = prompt_ids + target_ids
-            labels = [-100] * len(prompt_ids) + target_ids
-
-            full_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
-            labels_list.append(torch.tensor(labels, dtype=torch.long))
-
-        pad_id = self.tokenizer.pad_token_id
-        max_len = max(seq.size(0) for seq in full_ids_list)
-
-        input_ids = torch.full((len(full_ids_list), max_len), pad_id, dtype=torch.long)
-        attention_mask = torch.zeros((len(full_ids_list), max_len), dtype=torch.long)
-        labels = torch.full((len(labels_list), max_len), -100, dtype=torch.long)
-
-        for i, (ids, lbl) in enumerate(zip(full_ids_list, labels_list)):
-            seq_len = ids.size(0)
-            input_ids[i, :seq_len] = ids
-            attention_mask[i, :seq_len] = 1
-            labels[i, :seq_len] = lbl
-
-        return input_ids.to(self.device), attention_mask.to(self.device), labels.to(self.device)
 
     def compute_loss(self, output: dict, gt_masks: torch.Tensor, is_anomalous: torch.Tensor) -> tuple[torch.Tensor, dict]:
         ce_loss = output["vlm_out"]["loss"]
-        pred_masks = output["pred_masks"]
-
-        # sfl = sigmoid_focal_loss(pred_masks.float(), gt_masks.float())
-        bce = F.binary_cross_entropy_with_logits(pred_masks.float(), gt_masks.float())
-        dice_loss = soft_dice_loss(pred_masks, gt_masks)
+        bce, dice_loss = mask_loss_components(output["pred_masks"], gt_masks)
 
         # Project pooled query patches [B, 768] -> [B, 512] CLIP text space
         pooled_proj = output["query_features"].mean(dim=1).float() @ self.model.clip_model.visual.proj.float()
@@ -164,8 +170,8 @@ class AnomalyVLMTrainer:
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}", dynamic_ncols=True)
 
         for step, batch in enumerate(pbar, start=1):
-            input_ids, attn_mask, labels = self.build_training_tokens(
-                batch["user_prompts"], batch["target_responses"]
+            input_ids, attn_mask, labels = build_training_tokens(
+                self.tokenizer, batch["user_prompts"], batch["target_responses"], self.device
             )
             gt_masks = batch["masks"].to(self.device)
 
@@ -208,7 +214,9 @@ class AnomalyVLMTrainer:
                 bce=f"{running['bce'] / step:.3f}",
                 dice=f"{running['dice'] / step:.3f}",
                 align=f"{running['align'] / step:.3f}",
-                max_p=f"{output['pred_masks'].sigmoid().max().item():.2f}"
+                max_p=f"{output['pred_masks'].float().sigmoid().max().item():.3g}",
+                opt_step=self.global_step,
+                mask_lr=f"{self.optimizer.param_groups[-1]['lr']:.2g}",
             )
 
         return {k: v / len(dataloader) for k, v in running.items()}
@@ -266,8 +274,7 @@ def main():
         collate_fn=mmr_ad_collate_fn,
     )
 
-    total_opt_steps = (len(train_loader) // args.grad_accum_steps) * args.epochs
-    T_max=total_opt_steps
+    total_opt_steps = math.ceil(len(train_loader) / args.grad_accum_steps) * args.epochs
 
     model = ad_model(device=device)
     trainer = AnomalyVLMTrainer(
@@ -275,13 +282,12 @@ def main():
         lr_vlm=args.lr_vlm,
         lr_adapters=args.lr_adapters,
         grad_accum_steps=args.grad_accum_steps,
-        epochs=args.epochs,
+        total_optimizer_steps=total_opt_steps,
         device=device,
     )
 
     for epoch in range(1, args.epochs + 1):
         avg = trainer.train_epoch(train_loader, epoch, save_dir=args.save_dir, save_every_steps=1000)
-        trainer.scheduler.step()
         print(
             f"Epoch {epoch} done | total={avg['total']:.4f} "
             f"ce={avg['ce']:.4f} bce={avg['bce']:.4f} dice={avg['dice']:.4f}"

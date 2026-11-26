@@ -1,183 +1,146 @@
+"""Diagnose mask learning on one anomalous image with a pixel annotation."""
+
+import argparse
+import math
+from copy import deepcopy
+from pathlib import Path
+
+import numpy as np
 import torch
 from PIL import Image
-from arch.model import ad_model
-import bitsandbytes as bnb
+
+from arch.clip_mask_head import ClipMaskHead
+from arch.model import ad_model, pad_to_square
+from evaluate import load_checkpoint, save_vis
+from train import MASK_BCE_WEIGHT, MASK_DICE_WEIGHT, build_training_tokens, mask_loss_components
 
 
-class AnomalyVLMTrainer:
-    def __init__(
-        self,
-        model: ad_model,
-        lr_vlm: float = 2e-4,
-        lr_adapters: float = 1e-3,
-        weight_decay: float = 0.01,
-        max_grad_norm: float = 1.0,
-        device: str = "cuda",
-    ):
-        self.model = model
-        self.device = device
-        self.max_grad_norm = max_grad_norm
-        self.tokenizer = model.vlm_backbone.tokenizer
+def load_rgb(path: Path) -> Image.Image:
+    with Image.open(path) as image:
+        return image.convert("RGB")
 
-        # Ensure a pad token exists for batching later
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Separate parameter groups: lower LR for LoRA/VLM, higher LR for new adapters
-        vlm_params = [p for p in model.vlm_backbone.parameters() if p.requires_grad]
-        adapter_params = [
-            p for p in (
-                list(model.visual_residual_projector.parameters())
-                + list(model.query_conditioned_text_adapter.parameters())
-            )
-            if p.requires_grad
-        ]
-        self.optimizer = bnb.optim.PagedAdamW8bit(
-            [
-                {"params": vlm_params, "lr": lr_vlm},
-                {"params": adapter_params, "lr": lr_adapters},
-            ],
-            weight_decay=weight_decay,
-        )
+def load_mask(path: Path, image_size: tuple[int, int], mask_size: int = 256) -> torch.Tensor:
+    with Image.open(path) as image:
+        if image.size != image_size:
+            raise ValueError(f"Mask size {image.size} must match query image size {image_size}.")
+        mask = pad_to_square(image.convert("L")).resize((mask_size, mask_size), Image.Resampling.NEAREST)
+        foreground = np.asarray(mask) > 0
+    if not foreground.any() or foreground.all():
+        raise ValueError("The mask must contain both foreground and background after preprocessing.")
+    return torch.from_numpy(foreground)[None, None]
 
-    def build_training_tokens(
-        self,
-        user_prompts: list[str],
-        target_responses: list[str],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Formats chat prompt + target response into padded input_ids, attention_mask,
-        and labels (with -100 masking the user prompt and padding tokens).
-        """
-        full_ids_list = []
-        labels_list = []
 
-        for prompt, target in zip(user_prompts, target_responses):
-            messages = [{"role": "user", "content": prompt}]
-            prompt_str = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            # Append EOS so the model learns when to stop generating
-            target_str = target + self.tokenizer.eos_token
+@torch.no_grad()
+def report_mask(name: str, logits: torch.Tensor, target: torch.Tensor) -> np.ndarray:
+    probs = logits.float().sigmoid()
+    predicted = probs >= 0.5
+    iou = (predicted & target).sum() / (predicted | target).sum()
+    print(
+        f"{name} | foreground p={probs[target].mean().item():.4g} | "
+        f"background p={probs[~target].mean().item():.4g} | max p={probs.max().item():.4g} | "
+        f"IoU@0.5={iou.item():.3f}",
+        flush=True,
+    )
+    return probs[0, 0].cpu().numpy()
 
-            prompt_ids = self.tokenizer(prompt_str, add_special_tokens=False)["input_ids"]
-            target_ids = self.tokenizer(target_str, add_special_tokens=False)["input_ids"]
 
-            full_ids = prompt_ids + target_ids
-            # Mask out the prompt with -100 so CE loss only supervises the target response
-            labels = [-100] * len(prompt_ids) + target_ids
-
-            full_ids_list.append(torch.tensor(full_ids, dtype=torch.long))
-            labels_list.append(torch.tensor(labels, dtype=torch.long))
-
-        # Right-pad to the longest sequence in the batch
-        pad_id = self.tokenizer.pad_token_id
-        max_len = max(seq.size(0) for seq in full_ids_list)
-
-        input_ids = torch.full((len(full_ids_list), max_len), pad_id, dtype=torch.long)
-        attention_mask = torch.zeros((len(full_ids_list), max_len), dtype=torch.long)
-        labels = torch.full((len(labels_list), max_len), -100, dtype=torch.long)
-
-        for i, (ids, lbl) in enumerate(zip(full_ids_list, labels_list)):
-            seq_len = ids.size(0)
-            input_ids[i, :seq_len] = ids
-            attention_mask[i, :seq_len] = 1
-            labels[i, :seq_len] = lbl
-
-        return input_ids.to(self.device), attention_mask.to(self.device), labels.to(self.device)
-
-    def train_step(
-        self,
-        query_imgs: list[Image.Image],
-        reference_imgs: list[list[Image.Image]],
-        categories: list[str],
-        user_prompts: list[str],
-        target_responses: list[str],
-    ) -> float:
-        self.model.train()
-        # Keep frozen CLIP in eval mode so dropout/norms don't drift
-        self.model.clip_model.eval()
-
-        input_ids, attn_mask, labels = self.build_training_tokens(user_prompts, target_responses)
-
-        self.optimizer.zero_grad()
-
-        # BF16 autocast matches SmolVLMBackbone's compute_dtype and avoids needing GradScaler
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            output = self.model(
-                query_img=query_imgs,
-                reference_imgs=reference_imgs,
-                category=categories,
-                input_ids=input_ids,
-                text_attention_mask=attn_mask,
-                labels=labels,
-            )
-            vlm_out = output["vlm_out"]
-            loss = vlm_out["loss"]
-
+def fit_mask_head(
+    initial_head: ClipMaskHead,
+    mask_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    grid_size: tuple[int, int],
+    target: torch.Tensor,
+    steps: int,
+    lr: float,
+    pos_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    head = deepcopy(initial_head).train()
+    optimizer = torch.optim.AdamW(head.parameters(), lr=lr)
+    targets = target.float()
+    for _ in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        logits = head(*mask_inputs, grid_size=grid_size, target_size=target.shape[-2:])
+        bce, dice = mask_loss_components(logits, targets, pos_weight=pos_weight)
+        loss = MASK_BCE_WEIGHT * bce + MASK_DICE_WEIGHT * dice
+        if not torch.isfinite(loss):
+            raise RuntimeError("Mask loss became non-finite.")
         loss.backward()
+        optimizer.step()
 
-        # Clip gradients across all trainable parameters
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(trainable_params, self.max_grad_norm)
-
-        self.optimizer.step()
-        return loss.item()
+    with torch.no_grad():
+        return head(*mask_inputs, grid_size=grid_size, target_size=target.shape[-2:])
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--query", type=Path, required=True, help="Anomalous image")
+    parser.add_argument("--mask", type=Path, required=True, help="Binary mask for the query, with nonzero defect pixels")
+    parser.add_argument("--reference", type=Path, action="append", default=[], help="Normal image. May be repeated.")
+    parser.add_argument("--category", required=True)
+    parser.add_argument("--prompt", default="Is there any anomaly in the image?")
+    parser.add_argument("--target", help="Expected response, including <SEG>")
+    parser.add_argument("--checkpoint", type=Path, help="Start from and diagnose a trained checkpoint")
+    parser.add_argument("--steps", type=int, default=150, help="Head-only updates per loss setting")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max-new-tokens", type=int, default=256, help="Generation budget when testing a checkpoint")
+    parser.add_argument("--output-dir", type=Path, default=Path("toy_overfit_vis"))
+    args = parser.parse_args()
+    if args.steps < 1 or args.max_new_tokens < 1 or not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("Provide positive steps, learning rate, and generation budget.")
+
+    query = load_rgb(args.query)
+    target = load_mask(args.mask, query.size)
+    references = [load_rgb(path) for path in args.reference]
+    response = args.target or f"Yes. There is an anomaly in this {args.category}.\n<SEG>"
+
     device = "cuda"
-    print("Initializing model...")
-    model = ad_model(device=device)
-    trainer = AnomalyVLMTrainer(model=model, lr_vlm=2e-4, lr_adapters=1e-3, device=device)
+    target = target.to(device)
+    foreground_fraction = target.float().mean()
+    print(f"Ground-truth foreground: {100 * foreground_fraction.item():.2f}% of mask pixels", flush=True)
+    model = ad_model(device=device).eval()
+    if args.checkpoint:
+        load_checkpoint(model, args.checkpoint, device=device)
 
-    # 1. Load toy example
-    query_img = [Image.open("toy_dataset/inspinerator_cut.jpg")]
-    reference_imgs = [[Image.open("toy_dataset/inspinerator_good.jpg")]]
-    category = ["pcb"]
-
-    user_prompt = ["Is there any anomaly or defect in this pcb? Describe it if present."]
-    target_response = ["Anomalous. There is a cut defect on the surface. <SEG>"]
-
-    # 2. Overfit loop
-    num_steps = 150
-    print(f"Starting {num_steps}-step overfit test...")
-    for step in range(1, num_steps + 1):
-        loss = trainer.train_step(
-            query_imgs=query_img,
-            reference_imgs=reference_imgs,
-            categories=category,
-            user_prompts=user_prompt,
-            target_responses=target_response,
-        )
-        if step == 1 or step % 5 == 0:
-            print(f"Step {step:02d}/{num_steps} | Loss: {loss:.4f}")
-
-    # 3. Verify generation & <SEG> token capture
-    print("\nRunning inference check...")
     tokenizer = model.vlm_backbone.tokenizer
-    prompt_str = tokenizer.apply_chat_template(
-        [{"role": "user", "content": user_prompt[0]}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(prompt_str, return_tensors="pt").to(device)
+    ids, attention, labels = build_training_tokens(tokenizer, [args.prompt], [response], device)
+    grid_size = model.clip_model.visual.grid_size
+    print(f"Mask patch grid: {grid_size[0]} × {grid_size[1]}", flush=True)
+    with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.bfloat16):
+        prefix, adapted_text, features = model._build_prefix([query], [references], [args.category])
+        _, seg_hidden = model._teacher_forced_vlm(prefix, ids, attention, labels)
+        mask_inputs = features.clip_patches, adapted_text, features.reference_distance, seg_hidden
+        before = model.mask_head(*mask_inputs, grid_size=grid_size, target_size=target.shape[-2:])
 
-    texts, seg_hidden_states, mask_logits = model.generate(
-        query_img=query_img,
-        reference_imgs=reference_imgs,
-        category=category,
-        prompt_input_ids=inputs["input_ids"],
-        prompt_attention_mask=inputs["attention_mask"],
-        max_new_tokens=64,
-    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    target_image = target[0, 0].cpu().numpy()
+    probs = report_mask("Teacher-forced before fitting", before, target)
+    save_vis(query, target_image, probs, args.output_dir / "before.png")
 
-    print("Generated text:", texts[0])
-    print(
-        "Captured <SEG> hidden state:",
-        None if seg_hidden_states is None else tuple(seg_hidden_states.shape),
-    )
-    print("Mask logit shape:", None if mask_logits is None else tuple(mask_logits.shape))
+    foreground_weight = (1.0 - foreground_fraction) / foreground_fraction
+    for name, weight in (("training_loss", None), ("balanced_foreground", foreground_weight)):
+        fitted = fit_mask_head(model.mask_head, mask_inputs, grid_size, target, args.steps, args.lr, weight)
+        probs = report_mask(name, fitted, target)
+        save_vis(query, target_image, probs, args.output_dir / f"{name}.png")
+
+    if args.checkpoint:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}], tokenize=False, add_generation_prompt=True
+        )
+        inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            texts, _, generated = model.generate(
+                [query], [references], [args.category], inputs["input_ids"], inputs["attention_mask"],
+                max_new_tokens=args.max_new_tokens, mask_target_size=target.shape[-2:],
+            )
+        print(f"Generated response: {texts[0]!r}")
+        if generated is None:
+            print("Generation did not emit <SEG>. Evaluation would show an all-black mask.")
+            probs = np.zeros(target_image.shape, dtype=np.float32)
+        else:
+            probs = report_mask("Generated mask from checkpoint", generated, target)
+        save_vis(query, target_image, probs, args.output_dir / "generated.png")
+
+    print(f"Saved query, annotation, and prediction strips to {args.output_dir.resolve()}")
 
 
 if __name__ == "__main__":
