@@ -44,17 +44,20 @@ def _safe_open_rgb(path: str) -> Image.Image | None:
         return None
 
 def format_target_response(
-    cot: str,
+    cot: str | None,
     is_anomalous: int,
     cat_readable: str,
     decision_first: bool = True,
     max_cot_chars: int = 600,
 ) -> str:
     """Assembles Decision + CoT + <SEG> target string for SmolVLM."""
-    cot_clean = " ".join(cot.split())
-    if len(cot_clean) > max_cot_chars:
-        # Trim cleanly at the last sentence/word boundary
-        cot_clean = cot_clean[:max_cot_chars].rsplit(" ", 1)[0].rstrip(",;:") + "..."
+    if cot is not None:
+        cot_clean = " ".join(cot.split())
+        if len(cot_clean) > max_cot_chars:
+            # Trim cleanly at the last sentence/word boundary
+            cot_clean = cot_clean[:max_cot_chars].rsplit(" ", 1)[0].rstrip(",;:") + "..."
+    else:
+        cot_clean = ""
 
     if is_anomalous:
         decision = f"Yes. There is an anomaly in this {cat_readable}."
@@ -62,7 +65,11 @@ def format_target_response(
         decision = f"No. There is no anomaly in this {cat_readable}."
 
     if decision_first:
+        if not cot_clean:
+            return f"{decision}\n<SEG>"
         return f"{decision}\n<think>\n{cot_clean}\n</think>\n<SEG>"
+    if not cot_clean:
+        return f"{decision}\n<SEG>"
     return f"<think>\n{cot_clean}\n</think>\n{decision} <SEG>"
 
 def pad_to_square(img: Image.Image, fill: int = 0) -> Image.Image:
