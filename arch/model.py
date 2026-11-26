@@ -2,12 +2,11 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 import open_clip
-from open_clip.transformer import VisionTransformer
 from PIL import Image, ImageOps
+from arch.clip_mask_head import ClipMaskHead
 from arch.vlm import SmolVLMBackbone, VisualResidualProjector
 from arch.composite_features import CompositeFeatures
 from arch.text_adapter import ClipPromptEncoder, QueryConditionedTextAdapter
-from arch.sam_head import SamMaskBranch
 import torchvision.transforms as T
 
 def pad_to_square(img: Image.Image, fill: int = 0) -> Image.Image:
@@ -43,7 +42,9 @@ class ad_model(nn.Module):
             norm,
         ])
 
-        self.vis_dim = self.clip_model.visual.ln_post.bias.shape[0]
+        visual = self.clip_model.visual
+        self.vis_dim = visual.ln_post.bias.shape[0]
+        clip_dim = visual.proj.shape[-1]
 
         # initialize other modules
         self.vlm_backbone = SmolVLMBackbone()
@@ -56,9 +57,10 @@ class ad_model(nn.Module):
 
         self.visual_residual_projector = VisualResidualProjector(vis_dim=self.vis_dim, llm_dim=self.vlm_hidden_size, device=device)
         
-        self.query_conditioned_text_adapter = QueryConditionedTextAdapter(llm_dim=self.vlm_hidden_size, device=device)
-
-        self.sam_head = SamMaskBranch(llm_dim=self.vlm_hidden_size, vis_dim=self.vis_dim, device=device)
+        self.query_conditioned_text_adapter = QueryConditionedTextAdapter(
+            vis_dim=self.vis_dim, text_dim=clip_dim, llm_dim=self.vlm_hidden_size, device=device
+        )
+        self.mask_head = ClipMaskHead(self.vlm_hidden_size, clip_dim, self.composite_weights).to(device)
 
     def _build_prefix(
             self,
@@ -70,39 +72,36 @@ class ad_model(nn.Module):
         padded_query = [pad_to_square(img) for img in query_img]
         padded_refs = [[pad_to_square(img) for img in ref] for ref in reference_imgs]
 
-        query_features, _, absolute_residual, _ = self.composite_features(padded_query, padded_refs)
+        features = self.composite_features(padded_query, padded_refs)
+        query_tokens = features.query_tokens.float()
+        residual = features.residual.float()
         prompt_encodings = self.clip_prompt_encoder(category)
         adapted_text, adapted_text_llm = self.query_conditioned_text_adapter(
-            query_features, absolute_residual, prompt_encodings
+            query_tokens, residual, prompt_encodings
         )
-        vis_llm = self.visual_residual_projector(query_features, absolute_residual)
+        vis_llm = self.visual_residual_projector(query_tokens, residual)
 
         prefix_embeds = torch.cat([vis_llm, adapted_text_llm], dim=1)
-        return prefix_embeds, adapted_text, query_features, padded_query, absolute_residual
+        return prefix_embeds, adapted_text, features
 
     def _extract_seg_hidden(
             self,
             last_hidden_state: torch.Tensor,
-            input_ids: torch.Tensor,
+            target_ids: torch.Tensor,
             prefix_len: int,
             ) -> torch.Tensor:
         """
         Extracts h_seg [B, llm_dim] at the position predicting <SEG>,
         matching generate_from_embeds in vlm.py.
         """
-        B = input_ids.shape[0]
-        seg_id = self.vlm_backbone.seg_token_id
-        h_seg_list = []
-
-        for b in range(B):
-            matches = (input_ids[b] == seg_id).nonzero(as_tuple=True)[0]
-            if len(matches) == 0:
-                raise ValueError(f"Sample {b} in batch is missing the {self.vlm_backbone.seg_token} token.")
-            # Position predicting <SEG> is (prefix_len + seg_pos - 1)
-            pred_pos = prefix_len + matches[0].item() - 1
-            h_seg_list.append(last_hidden_state[b, pred_pos])
-
-        return torch.stack(h_seg_list, dim=0)  # [B, llm_dim]
+        matches = target_ids.to(last_hidden_state.device) == self.vlm_backbone.seg_token_id
+        has_seg = matches.any(dim=1)
+        if not has_seg.all():
+            missing = (~has_seg).nonzero(as_tuple=True)[0].tolist()
+            raise ValueError(f"Samples {missing} are missing a target {self.vlm_backbone.seg_token} token.")
+        prediction_positions = prefix_len + matches.long().argmax(dim=1) - 1
+        rows = torch.arange(target_ids.shape[0], device=last_hidden_state.device)
+        return last_hidden_state[rows, prediction_positions]
 
     def forward(
             self,
@@ -114,7 +113,7 @@ class ad_model(nn.Module):
             labels: torch.Tensor | None = None,
             mask_target_size: tuple[int, int] = (256, 256),
             ):
-        prefix_embeds, adapted_text, query_features, padded_query, absolute_residual = self._build_prefix(
+        prefix_embeds, adapted_text, features = self._build_prefix(
             query_img, reference_imgs, category
         )
         B, prefix_len, _ = prefix_embeds.shape
@@ -137,15 +136,19 @@ class ad_model(nn.Module):
             labels=full_labels,
         )
 
-        # Extract <SEG> representation and run SAM mask decoder
-        h_seg = self._extract_seg_hidden(vlm_out["last_hidden_state"], input_ids.to(device), prefix_len)
-        pred_masks = self.sam_head(padded_query, absolute_residual, h_seg, target_size=mask_target_size)
+        target_ids = labels if labels is not None else input_ids
+        target_ids = target_ids.to(device).masked_fill(text_attention_mask.to(device) == 0, -100)
+        h_seg = self._extract_seg_hidden(vlm_out["last_hidden_state"], target_ids, prefix_len)
+        pred_masks = self.mask_head(
+            features.clip_patches, adapted_text, features.reference_distance, h_seg,
+            grid_size=self.clip_model.visual.grid_size, target_size=mask_target_size,
+        )
 
         return {
             "vlm_out": vlm_out,
             "pred_masks": pred_masks,
             "adapted_text": adapted_text,
-            "query_features": query_features,
+            "query_features": features.query_tokens,
         }
 
     @torch.no_grad()
@@ -157,8 +160,10 @@ class ad_model(nn.Module):
         prompt_input_ids: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
         max_new_tokens: int = 64,
+        mask_target_size: tuple[int, int] = (1024, 1024),
     ):
-        prefix_embeds, adapted_text, query_features, padded_query, absolute_residual = self._build_prefix(query_img, reference_imgs, category)
+        """Return decoded text, captured <SEG> states, and logits on the padded image canvas."""
+        prefix_embeds, adapted_text, features = self._build_prefix(query_img, reference_imgs, category)
         B, prefix_len, _ = prefix_embeds.shape
         device = prefix_embeds.device
 
@@ -168,15 +173,17 @@ class ad_model(nn.Module):
         prefix_mask = torch.ones((B, prefix_len), dtype=prompt_attention_mask.dtype, device=device)
         full_mask = torch.cat([prefix_mask, prompt_attention_mask.to(device)], dim=1)
 
-        texts, seg_hidden_states = self.vlm_backbone.generate_from_embeds(
+        texts, seg_hidden_states, has_seg = self.vlm_backbone.generate_from_embeds(
             inputs_embeds=inputs_embeds,
             attention_mask=full_mask,
             max_new_tokens=max_new_tokens,
         )
 
-        sam_output = (
-            self.sam_head(padded_query, absolute_residual, seg_hidden_states, target_size=(1024, 1024))
-            if seg_hidden_states is not None
-            else None
+        if seg_hidden_states is None:
+            return texts, None, None
+        mask_logits = self.mask_head(
+            features.clip_patches, adapted_text, features.reference_distance, seg_hidden_states,
+            grid_size=self.clip_model.visual.grid_size, target_size=mask_target_size,
         )
-        return texts, seg_hidden_states, sam_output
+        mask_logits = mask_logits.masked_fill(~has_seg.to(mask_logits.device)[:, None, None, None], -100.0)
+        return texts, seg_hidden_states, mask_logits

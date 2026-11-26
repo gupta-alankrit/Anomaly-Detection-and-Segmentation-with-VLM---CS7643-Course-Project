@@ -3,7 +3,6 @@ import os
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from sklearn.metrics import average_precision_score, roc_auc_score
 from tqdm import tqdm
@@ -18,13 +17,14 @@ def load_checkpoint(model: ad_model, ckpt_dir: str, device: str = "cuda"):
     vlm_dir = os.path.join(ckpt_dir, "vlm_adapters")
     heads_path = os.path.join(ckpt_dir, "custom_heads.pt")
 
+    heads = torch.load(heads_path, map_location=device, weights_only=True)
+    if "mask_head" not in heads:
+        raise ValueError("Checkpoint is missing the CLIP mask head. Use a checkpoint saved by the updated trainer.")
+
     model.vlm_backbone.load_adapters(vlm_dir)
-    heads = torch.load(heads_path, map_location=device)
     model.visual_residual_projector.load_state_dict(heads["visual_residual_projector"])
     model.query_conditioned_text_adapter.load_state_dict(heads["query_conditioned_text_adapter"])
-    model.sam_head.prompt_generator.load_state_dict(heads["sam_prompt_generator"])
-    model.sam_head.sam.mask_decoder.load_state_dict(heads["sam_mask_decoder"])
-    # model.sam_head.dense_prompt_gen.load_state_dict(heads["sam_dense_prompt_gen"])
+    model.mask_head.load_state_dict(heads["mask_head"])
     model.eval()
 
 
@@ -106,27 +106,25 @@ def evaluate_category(
             add_generation_prompt=True,
         )
         inputs = tokenizer(prompt_str, return_tensors="pt").to(device)
+        gt_mask = sample["mask"].squeeze(0).numpy()  # [256, 256]
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            texts, seg_hidden, sam_logits = model.generate(
+            texts, _, mask_logits = model.generate(
                 query_img=[sample["query_img"]],
                 reference_imgs=[sample["reference_imgs"]],
                 category=[category],
                 prompt_input_ids=inputs["input_ids"],
                 prompt_attention_mask=inputs["attention_mask"],
                 max_new_tokens=256,
+                mask_target_size=gt_mask.shape,
             )
 
         gen_text = texts[0]
         gt_label = sample["is_anomalous"]
-        gt_mask = sample["mask"].squeeze(0).numpy()  # [256, 256]
 
-        if sam_logits is not None:
+        if mask_logits is not None:
             seg_emitted += 1
-            pred_logits = F.interpolate(
-                sam_logits.float(), size=gt_mask.shape, mode="bilinear", align_corners=False
-            )
-            pred_prob = torch.sigmoid(pred_logits).squeeze().cpu().numpy()
+            pred_prob = mask_logits[0, 0].float().sigmoid().cpu().numpy()
         else:
             pred_prob = np.zeros_like(gt_mask, dtype=np.float32)
 
@@ -146,7 +144,7 @@ def evaluate_category(
             gt_px = int((gt_mask > 0).sum())
             print(
                 f"  [{category} | gt={gt_label} | gt_px={gt_px:4d} | max_p={pred_prob.max():.3f} | "
-                f"seg={sam_logits is not None}] {gen_text!r}"
+                f"seg={mask_logits is not None}] {gen_text!r}"
             )
             if vis_dir:
                 out_path = os.path.join(vis_dir, category, f"sample_{idx}_gt{gt_label}.png")

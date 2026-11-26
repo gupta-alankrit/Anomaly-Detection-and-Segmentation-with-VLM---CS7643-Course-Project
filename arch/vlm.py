@@ -109,48 +109,56 @@ class SmolVLMBackbone(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor = None,
         max_new_tokens: int = 64,
-    ) -> tuple[list[str], torch.Tensor]:
-        """
-        Autoregressive greedy decoding for inference/evaluation, returning both the
-        decoded text and the final hidden state of the <SEG> token for SAM prompting.
-        """
+    ) -> tuple[list[str], torch.Tensor | None, torch.Tensor]:
+        """Decode text and capture the state predicting the first <SEG> in each row."""
         self.eval()
         core = self._unwrapped_vlm
         cur_embeds = inputs_embeds
-        cur_mask = attention_mask
+        batch_size, prompt_length, hidden_size = inputs_embeds.shape
+        device = inputs_embeds.device
+        cur_mask = attention_mask if attention_mask is not None else torch.ones(
+            (batch_size, prompt_length), dtype=torch.long, device=device
+        )
+        columns = torch.arange(prompt_length, device=device)
+        last_positions = columns.masked_fill(cur_mask == 0, 0).amax(dim=1)
+        rows = torch.arange(batch_size, device=device)
+        eos_token_id = self.tokenizer.eos_token_id
         generated_ids = []
-        seg_hidden_states = None
+        active = torch.ones(batch_size, dtype=torch.bool, device=device)
+        has_seg = torch.zeros_like(active)
+        seg_hidden_states = inputs_embeds.new_zeros((batch_size, hidden_size))
 
         for _ in range(max_new_tokens):
             out = core.model.text_model(
                 inputs_embeds=cur_embeds,
                 attention_mask=cur_mask,
+                position_ids=(cur_mask.long().cumsum(dim=1) - 1).clamp_min(0),
+                use_cache=False,
                 return_dict=True,
             )
-            last_hidden = out.last_hidden_state[:, -1, :]  # [B, D]
-            next_token = torch.argmax(core.lm_head(last_hidden), dim=-1, keepdim=True)  # [B, 1]
+            last_hidden = out.last_hidden_state[rows, last_positions]
+            next_token = core.lm_head(last_hidden).argmax(dim=-1)
+            next_token = next_token.masked_fill(~active, eos_token_id)
             generated_ids.append(next_token)
 
-            # Capture hidden state right when <SEG> is emitted
-            is_seg = (next_token.squeeze(-1) == self.seg_token_id)
-            if is_seg.any():
-                if seg_hidden_states is None:
-                    seg_hidden_states = torch.zeros_like(last_hidden)
-                seg_hidden_states[is_seg] = last_hidden[is_seg]
+            is_seg = active & ~has_seg & (next_token == self.seg_token_id)
+            seg_hidden_states = torch.where(is_seg[:, None], last_hidden, seg_hidden_states)
+            has_seg = has_seg | is_seg
 
-            if (next_token == self.tokenizer.eos_token_id).all():
+            cur_mask = torch.cat([cur_mask, active[:, None].to(cur_mask.dtype)], dim=1)
+            active = active & (next_token != eos_token_id)
+            if not active.any():
                 break
 
-            next_embed = self.embed_tokens(next_token)
-            cur_embeds = torch.cat([cur_embeds, next_embed], dim=1)
-            if cur_mask is not None:
-                cur_mask = torch.cat(
-                    [cur_mask, torch.ones_like(next_token, device=cur_mask.device)], dim=1
-                )
+            cur_embeds = torch.cat([cur_embeds, self.embed_tokens(next_token[:, None])], dim=1)
+            last_positions = torch.full_like(last_positions, cur_embeds.shape[1] - 1)
 
-        gen_tensor = torch.cat(generated_ids, dim=1)
-        texts = self.tokenizer.batch_decode(gen_tensor, skip_special_tokens=False)
-        return texts, seg_hidden_states
+        if not generated_ids:
+            return [""] * batch_size, None, has_seg
+        sequences = torch.stack(generated_ids, dim=1).tolist()
+        sequences = [ids[:ids.index(eos_token_id) + 1] if eos_token_id in ids else ids for ids in sequences]
+        texts = self.tokenizer.batch_decode(sequences, skip_special_tokens=False)
+        return texts, seg_hidden_states if has_seg.any() else None, has_seg
 
     def save_adapters(self, save_dir: str):
         """Saves only LoRA weights, tokenizer, and resized embedding layers."""

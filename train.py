@@ -74,23 +74,14 @@ class AnomalyVLMTrainer:
             )
             if p.requires_grad
         ]
-        sam_params = (
-            list(model.sam_head.prompt_generator.parameters())
-            + list(model.sam_head.sam.mask_decoder.parameters())
-        )
-
-        self.trainable_params = vlm_params + adapter_params + sam_params
-        sam_new_params = (
-            list(model.sam_head.prompt_generator.parameters())
-        )
-        sam_decoder_params = list(model.sam_head.sam.mask_decoder.parameters())
+        mask_params = [p for p in model.mask_head.parameters() if p.requires_grad]
+        self.trainable_params = vlm_params + adapter_params + mask_params
 
         self.optimizer = bnb.optim.PagedAdamW8bit(
             [
-                {"params": vlm_params, "lr": lr_vlm},            # e.g. 5e-5
-                {"params": adapter_params, "lr": lr_adapters},   # e.g. 5e-4
-                {"params": sam_new_params, "lr": lr_adapters},   # e.g. 5e-4
-                {"params": sam_decoder_params, "lr": 1e-4},      # pretrained decoder
+                {"params": vlm_params, "lr": lr_vlm},
+                {"params": adapter_params, "lr": lr_adapters},
+                {"params": mask_params, "lr": lr_adapters},
             ],
             weight_decay=weight_decay,
         )
@@ -167,8 +158,6 @@ class AnomalyVLMTrainer:
     def train_epoch(self, dataloader: DataLoader, epoch: int, save_dir: str | None = None, save_every_steps: int = 1000) -> dict:
         self.model.train()
         self.model.clip_model.eval()
-        self.model.sam_head.sam.vision_encoder.eval()
-        self.model.sam_head.sam.prompt_encoder.eval()
 
         self.optimizer.zero_grad()
         running = {"total": 0.0, "ce": 0.0, "bce": 0.0, "dice": 0.0, "align": 0.0}
@@ -228,13 +217,12 @@ class AnomalyVLMTrainer:
         os.makedirs(save_dir, exist_ok=True)
         # 1. Save LoRA + resized <SEG> embeddings
         self.model.vlm_backbone.save_adapters(os.path.join(save_dir, "vlm_adapters"))
-        # 2. Save custom trainable heads only (excludes frozen CLIP, SAM encoder, 4-bit VLM)
+        # 2. Save the trainable CLIP and VLM adapters and mask head
         torch.save(
             {
                 "visual_residual_projector": self.model.visual_residual_projector.state_dict(),
                 "query_conditioned_text_adapter": self.model.query_conditioned_text_adapter.state_dict(),
-                "sam_prompt_generator": self.model.sam_head.prompt_generator.state_dict(),
-                "sam_mask_decoder": self.model.sam_head.sam.mask_decoder.state_dict(),
+                "mask_head": self.model.mask_head.state_dict(),
             },
             os.path.join(save_dir, "custom_heads.pt"),
         )

@@ -32,13 +32,10 @@ class AnomalyVLMTrainer:
             )
             if p.requires_grad
         ]
-        sam_params = list(model.sam_head.prompt_generator.parameters()) + list(model.sam_head.sam.mask_decoder.parameters())
-
         self.optimizer = bnb.optim.PagedAdamW8bit(
             [
                 {"params": vlm_params, "lr": lr_vlm},
                 {"params": adapter_params, "lr": lr_adapters},
-                {"params": sam_params, "lr": lr_adapters},
             ],
             weight_decay=weight_decay,
         )
@@ -100,7 +97,6 @@ class AnomalyVLMTrainer:
         self.model.train()
         # Keep frozen CLIP in eval mode so dropout/norms don't drift
         self.model.clip_model.eval()
-        self.model.sam_head.sam.vision_encoder.eval()
 
         input_ids, attn_mask, labels = self.build_training_tokens(user_prompts, target_responses)
 
@@ -167,7 +163,7 @@ def main():
     )
     inputs = tokenizer(prompt_str, return_tensors="pt").to(device)
 
-    texts, seg_hidden_states = model.generate(
+    texts, seg_hidden_states, mask_logits = model.generate(
         query_img=query_img,
         reference_imgs=reference_imgs,
         category=category,
@@ -181,6 +177,7 @@ def main():
         "Captured <SEG> hidden state:",
         None if seg_hidden_states is None else tuple(seg_hidden_states.shape),
     )
+    print("Mask logit shape:", None if mask_logits is None else tuple(mask_logits.shape))
 
 
 if __name__ == "__main__":

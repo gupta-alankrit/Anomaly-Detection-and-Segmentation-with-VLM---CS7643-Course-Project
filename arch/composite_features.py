@@ -1,8 +1,8 @@
 """Frozen, batched multiscale patch matching with OpenCLIP."""
 import math
 from collections.abc import Sequence
+from typing import NamedTuple
 
-import open_clip
 import torch
 import torch.nn.functional as F
 from open_clip.transformer import VisionTransformer
@@ -10,15 +10,18 @@ import torchvision
 from PIL import Image
 
 
+class CompositePatchFeatures(NamedTuple):
+    query_tokens: torch.Tensor
+    residual: torch.Tensor
+    clip_patches: torch.Tensor
+    reference_distance: torch.Tensor
+
+
 def _scale_patch_tokens(visual: VisionTransformer, images: torch.Tensor) -> torch.Tensor:
     """Encode a resized image using interpolated positional embeddings."""
     height, width = images.shape[-2:]
     patch_height, patch_width = visual.patch_size
     grid_height, grid_width = height // patch_height, width // patch_width
-    if (height, width) == tuple(visual.image_size):
-        _, tokens = visual(images)
-        return tokens
-
     original_height, original_width = visual.grid_size
     positions = visual.positional_embedding
     if positions.shape[0] != 1 + original_height * original_width:
@@ -41,32 +44,30 @@ def _scale_patch_tokens(visual: VisionTransformer, images: torch.Tensor) -> torc
     return tokens
 
 
-def _multiscale_embeddings(
-    visual: VisionTransformer, images: torch.Tensor, scales: tuple[int, ...], weights: tuple[float, ...]
+def _multiscale_patch_tokens(
+    visual: VisionTransformer, images: torch.Tensor, base_tokens: torch.Tensor, scales: tuple[int, ...]
 ) -> torch.Tensor:
     patch_height, patch_width = visual.patch_size
     base_height, base_width = images.shape[-2:]
     base_grid = (base_height // patch_height, base_width // patch_width)
     features = []
-    for scale, weight in zip(scales, weights):
-        scaled = images if (scale, scale) == (base_height, base_width) else F.interpolate(
-            images, size=(scale, scale), mode="bilinear", align_corners=False, antialias=True
-        )
+    for scale in scales:
+        if (scale, scale) == (base_height, base_width):
+            features.append(base_tokens)
+            continue
+        scaled = F.interpolate(
+            images.float(), size=(scale, scale), mode="bilinear", align_corners=False, antialias=True
+        ).to(visual.conv1.weight.dtype)
         tokens = _scale_patch_tokens(visual, scaled)
         grid_height, grid_width = scale // patch_height, scale // patch_width
-        if tokens.shape[1] != grid_height * grid_width:
-            raise ValueError("Visual encoder did not return one token per image patch")
         spatial = tokens.transpose(1, 2).reshape(images.shape[0], -1, grid_height, grid_width)
-        if (grid_height, grid_width) != base_grid:
-            spatial = F.interpolate(spatial.float(), size=base_grid, mode="bilinear", align_corners=False)
-        vectors = spatial.flatten(2).transpose(1, 2)
-        features.append(F.normalize(vectors.float(), dim=-1) * math.sqrt(weight))
-    return F.normalize(torch.cat(features, dim=-1), dim=-1)
+        spatial = F.interpolate(spatial.float(), size=base_grid, mode="bilinear", align_corners=False)
+        features.append(spatial.flatten(2).transpose(1, 2))
+    return torch.stack(features, dim=2)  # [B, N, scales, visual width]
+
 
 class CompositeFeatures(torch.nn.Module):
-    """Extract query and best-matching reference patch features with frozen OpenCLIP.
-
-    """
+    """Extract aligned multiscale patches and match them to normal references."""
 
     def __init__(
         self,
@@ -100,38 +101,34 @@ class CompositeFeatures(torch.nn.Module):
                 or not any(self.weights)):
             raise ValueError("Provide one finite non-negative weight per scale, with at least one positive weight")
 
-    # def train(self, mode: bool = True):
-    #     super().train(mode)
-    #     self.model.eval()
-    #     return self
-
     @torch.no_grad()
     def forward(
         self,
         query_imgs: Sequence[Image.Image],
         ref_imgs: Sequence[Sequence[Image.Image]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Match each query against its own references.
-
-        Inputs are batches of PIL images and per-query reference lists, respectively.
-        Returns xq, xc, dx of shape [B, N, C] and best_sim of shape [B, N].
-        Queries without references have zero xc, dx, and best_sim.
-        """
+    ) -> CompositePatchFeatures:
+        """Return base tokens and residuals, projected patches, and normal-reference distances."""
         batch_size = len(query_imgs)
         if not batch_size or len(ref_imgs) != batch_size:
             raise ValueError("Provide a nonempty query batch and one reference list per query")
 
         counts = [len(refs) for refs in ref_imgs]
         images = [*query_imgs, *(image for refs in ref_imgs for image in refs)]
-        device = next(self.model.parameters()).device
-        imgs = torch.stack([self.preprocess(image.convert("RGB")) for image in images]).to(device)
         visual = self.model.visual
-        _, tokens = visual(imgs)
+        weight = visual.conv1.weight
+        device = weight.device
+        imgs = torch.stack([self.preprocess(image.convert("RGB")) for image in images]).to(device)
+        _, tokens = visual(imgs.to(weight.dtype))
         xq = tokens[:batch_size]
+        patches = _multiscale_patch_tokens(visual, imgs, tokens, self.scales)
+        clip_patches = patches[:batch_size].to(visual.proj.dtype) @ visual.proj
+        clip_patches = F.normalize(clip_patches.float(), dim=-1)
         if not sum(counts):
-            return xq, torch.zeros_like(xq), torch.zeros_like(xq), xq.new_zeros(xq.shape[:2])
+            return CompositePatchFeatures(xq, torch.zeros_like(xq), clip_patches, clip_patches.new_zeros(xq.shape[:2]))
 
-        match = _multiscale_embeddings(visual, imgs, self.scales, self.weights)
+        weights = clip_patches.new_tensor(self.weights).sqrt().view(-1, 1)
+        weighted_patches = F.normalize(patches.float(), dim=-1) * weights
+        match = F.normalize(weighted_patches.flatten(2), dim=-1)
         max_refs = max(counts)
         num_patches, channels = xq.shape[1:]
         ref_match = match.new_zeros((batch_size, max_refs, num_patches, match.shape[-1]))
@@ -148,7 +145,7 @@ class CompositeFeatures(torch.nn.Module):
         sim = sim.masked_fill(~valid[:, None, :, None], -torch.inf).flatten(2)
         best_sim, best = sim.max(dim=-1)
         xc = ref_tokens.flatten(1, 2).gather(1, best.unsqueeze(-1).expand(-1, -1, channels))
-        has_refs = valid.any(dim=1)
-        best_sim = torch.where(has_refs[:, None], best_sim, torch.zeros_like(best_sim))
-        dx = torch.where(has_refs[:, None, None], (xq - xc).abs(), torch.zeros_like(xq))
-        return xq, xc, dx, best_sim
+        has_refs = valid.any(dim=1, keepdim=True)
+        distance = (1.0 - best_sim.float()).clamp(0.0, 2.0).masked_fill(~has_refs, 0.0)
+        dx = torch.where(has_refs.unsqueeze(-1), (xq - xc).abs(), torch.zeros_like(xq))
+        return CompositePatchFeatures(xq, dx, clip_patches, distance)
