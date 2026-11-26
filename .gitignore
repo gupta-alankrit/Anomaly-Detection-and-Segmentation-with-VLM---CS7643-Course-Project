@@ -1,2 +1,4 @@
 scripts/WinCLIP/visa_anomaly_detection/visa/**
 **/__pycache__/**
+data/MMR-AD
+data/VisA
