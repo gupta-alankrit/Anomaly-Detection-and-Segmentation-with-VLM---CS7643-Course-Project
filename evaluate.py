@@ -30,7 +30,9 @@ def load_checkpoint(model: ad_model, ckpt_dir: str, device: str = "cuda"):
 
 def parse_yes_no(text: str) -> int | None:
     clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).lower()
-    has_yes, has_no = "yes" in clean, "no" in clean
+    clean_words = clean.split()
+    clean_words = [w.strip(".,!?") for w in clean_words]
+    has_yes, has_no = "yes" in clean_words, "no" in clean_words
     if has_yes and not has_no:
         return 1
     if has_no and not has_yes:
