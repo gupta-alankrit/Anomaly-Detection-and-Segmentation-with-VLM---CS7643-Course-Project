@@ -254,6 +254,7 @@ class MMRADDataset(Dataset):
         exclude_subdatasets: Sequence[str] | None = None,
         categories: Sequence[str] | None = None,
         k_shot: int = 1,
+        use_cot: bool = True,
         mask_size: int = 256,
         random_refs: bool = True,
         seed: int = 42,
@@ -280,6 +281,7 @@ class MMRADDataset(Dataset):
         self.mask_size = mask_size
         self.random_refs = random_refs
         self.rng = random.Random(seed)
+        self.use_cot = use_cot
 
         known = set(SUBDATASETS)
         if subdatasets is not None:
@@ -481,7 +483,7 @@ class MMRADDataset(Dataset):
             f"Is there any anomaly in the image?"
         )
         target_response = format_target_response(
-            cot=item["cot"],
+            cot=item["cot"] if self.use_cot else None,
             is_anomalous=item["is_anomalous"],
             cat_readable=cat_readable,
             decision_first=False,
@@ -526,7 +528,7 @@ def mmr_ad_collate_fn(batch: list[dict]) -> dict:
 
 
 if __name__ == "__main__":
-    ds = MMRADDataset(root_dir="data/MMR-AD", subdatasets=["mvtec", "wfdd"], k_shot=1, mask_size=256)
+    ds = MMRADDataset(root_dir="data/MMR-AD", subdatasets=["mvtec", "wfdd"], k_shot=1, mask_size=256, use_cot=True)
     n_anom = sum(s["is_anomalous"] for s in ds.samples)
     n_norm = len(ds) - n_anom
     print(
